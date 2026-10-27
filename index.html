@@ -31,6 +31,9 @@
   button.secondary { background: #4e5058; }
   button.secondary:hover { background: #6d6f78; }
   button.danger { background: var(--live); }
+  select { background: var(--bg); color: var(--text); border: 1px solid #3f4147;
+    border-radius: 6px; padding: 8px 10px; font: inherit; margin-left: 6px; }
+  label { color: var(--muted); }
   input[type=text] { background: var(--bg); color: var(--text); border: 1px solid #3f4147;
     border-radius: 6px; padding: 10px 12px; font: inherit; text-transform: uppercase; width: 140px; }
   .row { display: flex; flex-wrap: wrap; gap: 10px; align-items: center; }
@@ -57,7 +60,24 @@
   <section id="home">
     <div class="card">
       <h2>Stream dit spil</h2>
-      <p>1080p i 60 fps til op til 10 venner. Vælg din skærm eller dit spilvindue, og send linket til dine venner.</p>
+      <p>Op til 1440p i 120 fps til op til 10 venner. Vælg kvalitet, din skærm eller dit spilvindue, og send linket til dine venner.</p>
+      <div class="row" style="margin-bottom: 14px;">
+        <label>Opløsning
+          <select id="resSelect">
+            <option value="720">720p</option>
+            <option value="1080" selected>1080p</option>
+            <option value="1440">1440p</option>
+          </select>
+        </label>
+        <label>Billedrate
+          <select id="fpsSelect">
+            <option value="30">30 fps</option>
+            <option value="60" selected>60 fps</option>
+            <option value="120">120 fps</option>
+          </select>
+        </label>
+        <span class="stats" id="bitrateHint"></span>
+      </div>
       <button id="startBtn">Start stream</button>
     </div>
     <div class="card">
@@ -116,8 +136,27 @@
 
 <script>
 const MAX_VIEWERS = 10;
-const VIDEO_BITRATE = 15_000_000;   // 15 Mbps pr. seer, rigeligt til 1080p60
+const MAX_BITRATE = 50_000_000;     // loft pr. seer, også det seeren accepterer
 const AUDIO_BITRATE = 256_000;      // stereo spillyd
+const QUALITY_KEY = 'hqstream-quality';
+
+// Valgt kvalitet hos streameren. Bitraten skaleres efter pixels pr. sekund (1080p60 ≈ 15 Mbps).
+let quality = { height: 1080, fps: 60, bitrate: 15_000_000 };
+
+function readQuality() {
+  const height = Number($('resSelect').value);
+  const fps = Number($('fpsSelect').value);
+  const width = Math.round(height * 16 / 9);
+  const bitrate = Math.min(MAX_BITRATE, Math.round(width * height * fps * 0.12 / 1e6) * 1e6);
+  return { width, height, fps, bitrate };
+}
+
+function updateQualityHint() {
+  const q = readQuality();
+  const mbps = q.bitrate / 1e6;
+  $('bitrateHint').textContent = `≈ ${mbps} Mbps pr. seer · ${mbps * MAX_VIEWERS} Mbps upload ved ${MAX_VIEWERS} seere`;
+  try { localStorage.setItem(QUALITY_KEY, JSON.stringify({ height: q.height, fps: q.fps })); } catch {}
+}
 const ID_PREFIX = 'hqstream-dk-';
 
 const $ = id => document.getElementById(id);
@@ -146,7 +185,7 @@ function randomCode() {
 
 // Foretrækker H264 (hardware-encoding på de fleste GPU'er), starter med høj bitrate
 // og slår stereo-lyd i høj kvalitet til.
-function tuneSdp(sdp) {
+function tuneSdp(sdp, maxBitrate) {
   let lines = sdp.split('\r\n');
   const ptOf = l => l.match(/^a=rtpmap:(\d+)/)[1];
 
@@ -157,10 +196,11 @@ function tuneSdp(sdp) {
     const pts = parts.slice(3);
     lines[mIdx] = [...parts.slice(0, 3), ...pts.filter(p => h264.includes(p)), ...pts.filter(p => !h264.includes(p))].join(' ');
   }
-  const kbps = VIDEO_BITRATE / 1000;
+  const kbps = maxBitrate / 1000;
+  const startKbps = Math.min(kbps * 0.6, 10_000);
   lines = lines.map(l => {
     const m = l.match(/^a=fmtp:(\d+) /);
-    if (m && h264.includes(m[1])) return `${l};x-google-start-bitrate=${kbps * 0.6};x-google-max-bitrate=${kbps}`;
+    if (m && h264.includes(m[1])) return `${l};x-google-start-bitrate=${startKbps};x-google-max-bitrate=${kbps}`;
     return l;
   });
 
@@ -182,8 +222,8 @@ function tuneSenders(call) {
       const params = sender.getParameters();
       if (!params.encodings || !params.encodings.length) params.encodings = [{}];
       if (sender.track.kind === 'video') {
-        params.encodings[0].maxBitrate = VIDEO_BITRATE;
-        params.encodings[0].maxFramerate = 60;
+        params.encodings[0].maxBitrate = quality.bitrate;
+        params.encodings[0].maxFramerate = quality.fps;
         params.degradationPreference = 'maintain-framerate';
       } else {
         params.encodings[0].maxBitrate = AUDIO_BITRATE;
@@ -199,9 +239,13 @@ function tuneSenders(call) {
 /* ---------- Streamer ---------- */
 
 async function startHost() {
+  quality = readQuality();
   try {
     localStream = await navigator.mediaDevices.getDisplayMedia({
-      video: { width: { ideal: 1920 }, height: { ideal: 1080 }, frameRate: { ideal: 60, max: 60 } },
+      video: {
+        width: { ideal: quality.width }, height: { ideal: quality.height },
+        frameRate: { ideal: quality.fps, max: quality.fps },
+      },
       audio: { echoCancellation: false, noiseSuppression: false, autoGainControl: false, channelCount: 2 },
       systemAudio: 'include',
       selfBrowserSurface: 'exclude',
@@ -238,7 +282,7 @@ function openRoom(code) {
         setTimeout(() => conn.close(), 500);
         return;
       }
-      const call = peer.call(conn.peer, localStream, { sdpTransform: tuneSdp });
+      const call = peer.call(conn.peer, localStream, { sdpTransform: sdp => tuneSdp(sdp, quality.bitrate) });
       tuneSenders(call);
       viewers.set(conn.peer, { conn, call });
       updateViewerCount();
@@ -309,25 +353,29 @@ async function diagnose() {
   const limit = out.qualityLimitationReason || 'none';
   const hdr = matchMedia('(dynamic-range: high)').matches;
 
+  const minFps = quality.fps * 0.83;
+
   let verdict;
-  if (captureFps < 50) {
+  if (captureFps < minFps) {
     verdict = hdr
       ? 'Skærmoptagelsen er for langsom. HDR er slået til – prøv at slå det fra (Win + Alt + B).'
-      : 'Skærmoptagelsen er for langsom. Del "Hele skærmen" og kør spillet i borderless fullscreen.';
+      : quality.fps > 60
+        ? `Skærmoptagelsen når ikke ${quality.fps} fps. Tjek at skærmen kører ${quality.fps} Hz, eller vælg 60 fps.`
+        : 'Skærmoptagelsen er for langsom. Del "Hele skærmen" og kør spillet i borderless fullscreen.';
   } else if (hardware === false) {
     verdict = 'Videoen kodes af processoren. Slå "Brug grafikacceleration" til i browserens indstillinger og genstart den.';
   } else if (limit === 'cpu') {
     verdict = 'Computeren kan ikke følge med til at kode videoen.';
   } else if (limit === 'bandwidth') {
     verdict = 'Internetforbindelsen er flaskehalsen.';
-  } else if (sendFps < 50) {
+  } else if (sendFps < minFps) {
     verdict = 'Billedraten er lav, men årsagen er uklar. Prøv at genstarte streamen.';
   } else {
     verdict = 'Alt ser fint ud.';
   }
 
   const encoder = hardware === undefined ? 'ukendt' : hardware ? 'grafikkort' : 'processor';
-  const details = `Optager ${captureFps} fps · sender ${sendFps} fps · encoder: ${encoder}` +
+  const details = `Mål ${quality.height}p${quality.fps} · optager ${captureFps} fps · sender ${sendFps} fps · encoder: ${encoder}` +
     `${out.encoderImplementation ? ` (${out.encoderImplementation})` : ''} · begrænset af: ${LIMIT_TEXT[limit] ?? limit} · HDR: ${hdr ? 'til' : 'fra'}`;
   return { ok: verdict === 'Alt ser fint ud.', verdict, details };
 }
@@ -374,7 +422,7 @@ function joinRoom(code) {
   });
 
   peer.on('call', call => {
-    call.answer(undefined, { sdpTransform: tuneSdp });
+    call.answer(undefined, { sdpTransform: sdp => tuneSdp(sdp, MAX_BITRATE) });
     call.on('stream', stream => {
       $('remote').srcObject = stream;
       $('remote').play().catch(() => {});
@@ -405,6 +453,15 @@ async function updateViewStats(pc) {
 }
 
 /* ---------- Knapper ---------- */
+
+try {
+  const saved = JSON.parse(localStorage.getItem(QUALITY_KEY));
+  if ([720, 1080, 1440].includes(saved?.height)) $('resSelect').value = saved.height;
+  if ([30, 60, 120].includes(saved?.fps)) $('fpsSelect').value = saved.fps;
+} catch {}
+$('resSelect').onchange = updateQualityHint;
+$('fpsSelect').onchange = updateQualityHint;
+updateQualityHint();
 
 $('startBtn').onclick = startHost;
 $('stopBtn').onclick = stopHost;
