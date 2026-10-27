@@ -39,6 +39,9 @@
   .player { position: relative; background: #000; border-radius: 10px; overflow: hidden; aspect-ratio: 16 / 9; }
   .player video { width: 100%; height: 100%; display: block; object-fit: contain; }
   .stats { font-family: Consolas, monospace; font-size: 13px; color: var(--muted); }
+  .diag { margin-top: 12px; background: var(--bg); border-radius: 6px; padding: 10px 12px; }
+  .diag strong { display: block; color: var(--text); font-family: system-ui, "Segoe UI", sans-serif; margin-bottom: 2px; }
+  .diag.bad strong { color: #f0b232; }
   .warn { background: #4a3a10; color: #f0d48a; padding: 10px 12px; border-radius: 6px; margin-top: 12px; }
   [hidden] { display: none !important; }
 </style>
@@ -85,6 +88,7 @@
         <span class="stats" id="hostStats"></span>
       </div>
       <div class="player"><video id="preview" autoplay playsinline muted></video></div>
+      <div class="diag stats" id="hostDiag" hidden><strong></strong><span></span></div>
     </div>
   </section>
 
@@ -105,6 +109,7 @@
           <button id="leaveBtn" class="secondary">Forlad</button>
         </div>
       </div>
+      <div class="diag stats" id="viewDiag" hidden><strong></strong><span></span></div>
     </div>
   </section>
 </main>
@@ -275,6 +280,63 @@ async function updateHostStats() {
   const mbps = Math.max(0, (sent - lastSent) * 8 / 1e6);
   lastSent = sent;
   if (s) $('hostStats').textContent = `${s.width}×${s.height} · ${Math.round(s.frameRate)} fps · upload ${mbps.toFixed(1)} Mbps`;
+
+  const diag = await diagnose();
+  if (!diag) return;
+  renderDiag($('hostDiag'), diag);
+  for (const { conn } of viewers.values()) {
+    if (conn.open) conn.send({ type: 'diag', diag });
+  }
+}
+
+const LIMIT_TEXT = { none: 'ingen', cpu: 'processoren', bandwidth: 'internetforbindelsen', other: 'andet' };
+
+// Finder flaskehalsen ud fra den første seers forbindelse: optagelse, encoder, CPU eller netværk.
+async function diagnose() {
+  const first = viewers.values().next().value;
+  const report = await first?.call.peerConnection?.getStats();
+  if (!report) return null;
+  let source, out;
+  report.forEach(r => {
+    if (r.type === 'media-source' && r.kind === 'video') source = r;
+    if (r.type === 'outbound-rtp' && r.kind === 'video') out = r;
+  });
+  if (!source || !out) return null;
+
+  const captureFps = Math.round(source.framesPerSecond ?? 0);
+  const sendFps = Math.round(out.framesPerSecond ?? 0);
+  const hardware = out.powerEfficientEncoder;
+  const limit = out.qualityLimitationReason || 'none';
+  const hdr = matchMedia('(dynamic-range: high)').matches;
+
+  let verdict;
+  if (captureFps < 50) {
+    verdict = hdr
+      ? 'Skærmoptagelsen er for langsom. HDR er slået til – prøv at slå det fra (Win + Alt + B).'
+      : 'Skærmoptagelsen er for langsom. Del "Hele skærmen" og kør spillet i borderless fullscreen.';
+  } else if (hardware === false) {
+    verdict = 'Videoen kodes af processoren. Slå "Brug grafikacceleration" til i browserens indstillinger og genstart den.';
+  } else if (limit === 'cpu') {
+    verdict = 'Computeren kan ikke følge med til at kode videoen.';
+  } else if (limit === 'bandwidth') {
+    verdict = 'Internetforbindelsen er flaskehalsen.';
+  } else if (sendFps < 50) {
+    verdict = 'Billedraten er lav, men årsagen er uklar. Prøv at genstarte streamen.';
+  } else {
+    verdict = 'Alt ser fint ud.';
+  }
+
+  const encoder = hardware === undefined ? 'ukendt' : hardware ? 'grafikkort' : 'processor';
+  const details = `Optager ${captureFps} fps · sender ${sendFps} fps · encoder: ${encoder}` +
+    `${out.encoderImplementation ? ` (${out.encoderImplementation})` : ''} · begrænset af: ${LIMIT_TEXT[limit] ?? limit} · HDR: ${hdr ? 'til' : 'fra'}`;
+  return { ok: verdict === 'Alt ser fint ud.', verdict, details };
+}
+
+function renderDiag(el, diag) {
+  el.hidden = false;
+  el.classList.toggle('bad', !diag.ok);
+  el.querySelector('strong').textContent = diag.verdict;
+  el.querySelector('span').textContent = diag.details;
 }
 
 function stopHost() {
@@ -298,7 +360,16 @@ function joinRoom(code) {
 
   peer.on('open', () => {
     const conn = peer.connect(ID_PREFIX + code, { reliable: true });
-    conn.on('data', d => { if (d?.type === 'full') setStatus('Rummet er fuldt (max 10 seere)', 'err'); });
+    conn.on('data', d => {
+      if (d?.type === 'full') setStatus('Rummet er fuldt (max 10 seere)', 'err');
+      if (d?.type === 'diag' && d.diag) {
+        renderDiag($('viewDiag'), {
+          ok: Boolean(d.diag.ok),
+          verdict: 'Streamer: ' + String(d.diag.verdict).slice(0, 200),
+          details: String(d.diag.details).slice(0, 300),
+        });
+      }
+    });
     conn.on('close', () => setStatus('Streamen er slut'));
   });
 
