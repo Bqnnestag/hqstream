@@ -136,18 +136,18 @@
 
 <script>
 const MAX_VIEWERS = 10;
-const MAX_BITRATE = 50_000_000;     // loft pr. seer, også det seeren accepterer
+const MAX_BITRATE = 80_000_000;     // loft pr. seer, også det seeren accepterer
 const AUDIO_BITRATE = 256_000;      // stereo spillyd
 const QUALITY_KEY = 'hqstream-quality';
 
-// Valgt kvalitet hos streameren. Bitraten skaleres efter pixels pr. sekund (1080p60 ≈ 15 Mbps).
-let quality = { height: 1080, fps: 60, bitrate: 15_000_000 };
+// Valgt kvalitet hos streameren. Bitraten skaleres efter pixels pr. sekund (1080p60 ≈ 31 Mbps).
+let quality = { height: 1080, fps: 60, bitrate: 31_000_000 };
 
 function readQuality() {
   const height = Number($('resSelect').value);
   const fps = Number($('fpsSelect').value);
   const width = Math.round(height * 16 / 9);
-  const bitrate = Math.min(MAX_BITRATE, Math.round(width * height * fps * 0.12 / 1e6) * 1e6);
+  const bitrate = Math.min(MAX_BITRATE, Math.round(width * height * fps * 0.25 / 1e6) * 1e6);
   return { width, height, fps, bitrate };
 }
 
