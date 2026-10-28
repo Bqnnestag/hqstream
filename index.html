@@ -69,7 +69,7 @@
     <div class="card">
       <h2>Stream dit spil</h2>
       <p>Op til 1440p i 120 fps til op til 10 venner. Vælg kvalitet, din skærm eller dit spilvindue, og send linket til dine venner.</p>
-      <div class="row" style="margin-bottom: 14px;">
+      <div class="row" id="qualityRow" style="margin-bottom: 14px;">
         <label>Opløsning
           <select id="resSelect">
             <option value="720">720p</option>
@@ -115,6 +115,8 @@
         <button id="copyBtn" class="secondary">Kopiér</button>
         <button id="stopBtn" class="danger">Stop stream</button>
       </div>
+      <div id="audioWarn" class="warn" hidden></div>
+      <div style="margin-top: 14px;" id="hostQuality"></div>
       <div id="fileWarn" class="warn" hidden>Siden er åbnet som en lokal fil, så linket virker ikke for andre. Dine venner kan i stedet åbne siden og skrive koden.</div>
     </div>
     <div class="card">
@@ -267,27 +269,61 @@ function tuneSdp(sdp, maxBitrate) {
   return lines.join('\r\n');
 }
 
+async function applySenderParams(pc) {
+  for (const sender of pc.getSenders()) {
+    if (!sender.track) continue;
+    const params = sender.getParameters();
+    if (!params.encodings || !params.encodings.length) params.encodings = [{}];
+    if (sender.track.kind === 'video') {
+      params.encodings[0].maxBitrate = quality.bitrate;
+      params.encodings[0].maxFramerate = quality.fps;
+      params.degradationPreference = 'maintain-framerate';
+    } else {
+      params.encodings[0].maxBitrate = AUDIO_BITRATE;
+    }
+    try { await sender.setParameters(params); } catch (e) { console.warn('setParameters', e); }
+  }
+}
+
 function tuneSenders(call) {
   const pc = call.peerConnection;
   if (!pc) return;
-  const apply = async () => {
-    for (const sender of pc.getSenders()) {
-      if (!sender.track) continue;
-      const params = sender.getParameters();
-      if (!params.encodings || !params.encodings.length) params.encodings = [{}];
-      if (sender.track.kind === 'video') {
-        params.encodings[0].maxBitrate = quality.bitrate;
-        params.encodings[0].maxFramerate = quality.fps;
-        params.degradationPreference = 'maintain-framerate';
-      } else {
-        params.encodings[0].maxBitrate = AUDIO_BITRATE;
-      }
-      try { await sender.setParameters(params); } catch (e) { console.warn('setParameters', e); }
-    }
-  };
   pc.addEventListener('connectionstatechange', () => {
-    if (pc.connectionState === 'connected') apply();
+    if (pc.connectionState === 'connected') applySenderParams(pc);
   });
+}
+
+function captureConstraints() {
+  return {
+    width: { max: quality.width }, height: { max: quality.height },
+    frameRate: { ideal: quality.fps, max: quality.fps },
+  };
+}
+
+// Skifter kvalitet midt i en stream: ny optagelse fra skærmen og nyt loft for bitrate hos alle seere.
+async function applyLiveQuality() {
+  quality = readQuality();
+  const track = localStream?.getVideoTracks()[0];
+  if (!track) return;
+  try { await track.applyConstraints(captureConstraints()); } catch (e) { console.warn('applyConstraints', e); }
+  for (const { call } of viewers.values()) {
+    if (call.peerConnection) applySenderParams(call.peerConnection);
+  }
+}
+
+// Browseren kan kun tage lyd med fra hele skærmen (systemlyd) eller en fane, ikke fra et enkelt programvindue.
+function checkAudio() {
+  const surface = localStream.getVideoTracks()[0].getSettings().displaySurface;
+  const hasAudio = localStream.getAudioTracks().length > 0;
+  let text = '';
+  if (!hasAudio && surface === 'window') {
+    text = 'Der er ingen lyd med. Browseren kan ikke tage lyd fra et enkelt programvindue. ' +
+      'Stop og start igen, vælg "Hele skærmen", og sæt flueben ved "Del systemlyd".';
+  } else if (!hasAudio) {
+    text = 'Der er ingen lyd med. Stop og start igen, og sæt flueben ved "Del systemlyd" (eller "Del lyd fra fanen").';
+  }
+  $('audioWarn').textContent = text;
+  $('audioWarn').hidden = !text;
 }
 
 /* ---------- Streamer ---------- */
@@ -296,10 +332,7 @@ async function startHost() {
   quality = readQuality();
   try {
     localStream = await navigator.mediaDevices.getDisplayMedia({
-      video: {
-        width: { ideal: quality.width }, height: { ideal: quality.height },
-        frameRate: { ideal: quality.fps, max: quality.fps },
-      },
+      video: captureConstraints(),
       audio: { echoCancellation: false, noiseSuppression: false, autoGainControl: false, channelCount: 2 },
       systemAudio: 'include',
       selfBrowserSurface: 'exclude',
@@ -313,6 +346,8 @@ async function startHost() {
   videoTrack.addEventListener('ended', stopHost);
 
   show('host');
+  $('hostQuality').append($('qualityRow'));
+  checkAudio();
   $('preview').srcObject = localStream;
   $('fileWarn').hidden = location.protocol !== 'file:';
   setStatus('Forbinder…');
@@ -336,7 +371,7 @@ function openRoom(code) {
         setTimeout(() => conn.close(), 500);
         return;
       }
-      const call = peer.call(conn.peer, localStream, { sdpTransform: sdp => tuneSdp(sdp, quality.bitrate) });
+      const call = peer.call(conn.peer, localStream, { sdpTransform: sdp => tuneSdp(sdp, MAX_BITRATE) });
       tuneSenders(call);
       viewers.set(conn.peer, { conn, call, name: '' });
       updateViewers();
@@ -458,6 +493,7 @@ function stopHost() {
   localStream = null;
   peer?.destroy();
   peer = null;
+  $('startBtn').before($('qualityRow'));
   show('home');
   setStatus('Stream stoppet');
 }
@@ -528,9 +564,9 @@ try {
   if ([30, 60, 120].includes(saved?.fps)) $('fpsSelect').value = saved.fps;
   if (saved?.level in BITRATE_LEVELS) $('bitrateSelect').value = saved.level;
 } catch {}
-$('resSelect').onchange = updateQualityHint;
-$('fpsSelect').onchange = updateQualityHint;
-$('bitrateSelect').onchange = updateQualityHint;
+for (const id of ['resSelect', 'fpsSelect', 'bitrateSelect']) {
+  $(id).onchange = () => { updateQualityHint(); applyLiveQuality(); };
+}
 updateQualityHint();
 
 $('startBtn').onclick = startHost;
