@@ -145,6 +145,13 @@
       <div class="row" style="justify-content: space-between; margin-top: 12px;">
         <span class="stats" id="viewStats">Venter på video…</span>
         <div class="row">
+          <label>Buffer
+            <select id="bufferSelect">
+              <option value="">Normal</option>
+              <option value="500">Stabil (0,5 s)</option>
+              <option value="1500">Meget stabil (1,5 s)</option>
+            </select>
+          </label>
           <label>🔊 <input id="volume" type="range" min="0" max="1" step="0.01" value="1"></label>
           <button id="fullBtn" class="secondary">Fuld skærm</button>
           <button id="leaveBtn" class="secondary">Forlad</button>
@@ -163,6 +170,7 @@ const UPLOAD_MBPS = 1000;            // jeres forbindelse; over dette advares de
 const AUDIO_BITRATE = 256_000;      // stereo spillyd
 const QUALITY_KEY = 'hqstream-quality';
 const NAME_KEY = 'hqstream-name';
+const BUFFER_KEY = 'hqstream-buffer';
 const ANON_NAME = 'Anonym seer';
 
 // Bits pr. pixel pr. billede. Bitraten skaleres efter pixels pr. sekund (1080p60: 31 / 50 / 75 Mbps).
@@ -528,6 +536,8 @@ function joinRoom(code, name = '') {
   peer.on('call', call => {
     call.answer(undefined, { sdpTransform: sdp => tuneSdp(sdp, MAX_BITRATE) });
     call.on('stream', stream => {
+      viewerPc = call.peerConnection;
+      applyBuffer();
       $('remote').srcObject = stream;
       $('remote').play().catch(() => {});
       setStatus('● Ser stream', 'ok');
@@ -543,7 +553,23 @@ function joinRoom(code, name = '') {
   });
 }
 
+let viewerPc = null;
+
+// Større buffer = lidt forsinkelse, men tid til at hente tabte pakker igen, så billedet hakker mindre.
+function applyBuffer() {
+  const value = $('bufferSelect').value;
+  const ms = value === '' ? null : Number(value);
+  try { localStorage.setItem(BUFFER_KEY, value); } catch {}
+  for (const receiver of viewerPc?.getReceivers() ?? []) {
+    try {
+      if ('jitterBufferTarget' in receiver) receiver.jitterBufferTarget = ms;
+      else receiver.playoutDelayHint = ms === null ? 0 : ms / 1000;
+    } catch (e) { console.warn('buffer', e); }
+  }
+}
+
 let lastRecv = 0;
+let lastBuffer = { delay: 0, count: 0 };
 async function updateViewStats(pc) {
   const report = await pc.getStats();
   let video, codec;
@@ -552,8 +578,13 @@ async function updateViewStats(pc) {
   if (video.codecId) codec = report.get(video.codecId)?.mimeType?.split('/')[1];
   const mbps = Math.max(0, (video.bytesReceived - lastRecv) * 8 / 1e6);
   lastRecv = video.bytesReceived;
+  // Gennemsnitlig buffer det sidste sekund.
+  const dDelay = (video.jitterBufferDelay ?? 0) - lastBuffer.delay;
+  const dCount = (video.jitterBufferEmittedCount ?? 0) - lastBuffer.count;
+  lastBuffer = { delay: video.jitterBufferDelay ?? 0, count: video.jitterBufferEmittedCount ?? 0 };
+  const bufferMs = dCount > 0 ? Math.round(dDelay / dCount * 1000) : 0;
   $('viewStats').textContent =
-    `${video.frameWidth ?? '?'}×${video.frameHeight ?? '?'} · ${Math.round(video.framesPerSecond ?? 0)} fps · ${mbps.toFixed(1)} Mbps · ${codec ?? ''}`;
+    `${video.frameWidth ?? '?'}×${video.frameHeight ?? '?'} · ${Math.round(video.framesPerSecond ?? 0)} fps · ${mbps.toFixed(1)} Mbps · ${codec ?? ''} · buffer ${bufferMs} ms`;
 }
 
 /* ---------- Knapper ---------- */
@@ -592,7 +623,12 @@ $('joinBtn').onclick = () => {
 };
 $('nameInput').addEventListener('keydown', e => { if (e.key === 'Enter') $('joinBtn').click(); });
 try { $('nameInput').value = localStorage.getItem(NAME_KEY) || ''; } catch {}
-$('volume').oninput = e => { $('remote').volume = e.target.value; };
+try {
+  const savedBuffer = localStorage.getItem(BUFFER_KEY);
+  if (['', '500', '1500'].includes(savedBuffer)) $('bufferSelect').value = savedBuffer;
+} catch {}
+$('bufferSelect').onchange = applyBuffer;
+$('volume').oninput =e => { $('remote').volume = e.target.value; };
 $('fullBtn').onclick = () => $('remote').requestFullscreen();
 $('remote').ondblclick = () => $('remote').requestFullscreen();
 $('leaveBtn').onclick = () => { peer?.destroy(); location.href = location.pathname; };
