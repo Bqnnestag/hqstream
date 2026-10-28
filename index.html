@@ -84,6 +84,13 @@
             <option value="120">120 fps</option>
           </select>
         </label>
+        <label>Bitrate
+          <select id="bitrateSelect">
+            <option value="low">Lav</option>
+            <option value="medium" selected>Mellem</option>
+            <option value="high">Høj</option>
+          </select>
+        </label>
         <span class="stats" id="bitrateHint"></span>
       </div>
       <button id="startBtn">Start stream</button>
@@ -149,28 +156,35 @@
 
 <script>
 const MAX_VIEWERS = 10;
-const MAX_BITRATE = 100_000_000;     // loft pr. seer, også det seeren accepterer
+const MAX_BITRATE = 150_000_000;     // loft pr. seer, også det seeren accepterer
+const UPLOAD_MBPS = 1000;            // jeres forbindelse; over dette advares der
 const AUDIO_BITRATE = 256_000;      // stereo spillyd
 const QUALITY_KEY = 'hqstream-quality';
 const NAME_KEY = 'hqstream-name';
 const ANON_NAME = 'Anonym seer';
 
-// Valgt kvalitet hos streameren. Bitraten skaleres efter pixels pr. sekund (1080p60 ≈ 31 Mbps).
-let quality = { height: 1080, fps: 60, bitrate: 31_000_000 };
+// Bits pr. pixel pr. billede. Bitraten skaleres efter pixels pr. sekund (1080p60: 31 / 50 / 75 Mbps).
+const BITRATE_LEVELS = { low: 0.25, medium: 0.4, high: 0.6 };
+
+// Valgt kvalitet hos streameren.
+let quality = { height: 1080, fps: 60, bitrate: 50_000_000 };
 
 function readQuality() {
   const height = Number($('resSelect').value);
   const fps = Number($('fpsSelect').value);
+  const level = $('bitrateSelect').value;
   const width = Math.round(height * 16 / 9);
-  const bitrate = Math.min(MAX_BITRATE, Math.round(width * height * fps * 0.25 / 1e6) * 1e6);
-  return { width, height, fps, bitrate };
+  const bitrate = Math.min(MAX_BITRATE, Math.round(width * height * fps * BITRATE_LEVELS[level] / 1e6) * 1e6);
+  return { width, height, fps, level, bitrate };
 }
 
 function updateQualityHint() {
   const q = readQuality();
   const mbps = q.bitrate / 1e6;
-  $('bitrateHint').textContent = `≈ ${mbps} Mbps pr. seer · ${mbps * MAX_VIEWERS} Mbps upload ved ${MAX_VIEWERS} seere`;
-  try { localStorage.setItem(QUALITY_KEY, JSON.stringify({ height: q.height, fps: q.fps })); } catch {}
+  const total = mbps * MAX_VIEWERS;
+  $('bitrateHint').textContent = `≈ ${mbps} Mbps pr. seer · ${total} Mbps upload ved ${MAX_VIEWERS} seere` +
+    (total > UPLOAD_MBPS ? ` – mere end ${UPLOAD_MBPS / 1000} Gbit, så hold dig til færre seere` : '');
+  try { localStorage.setItem(QUALITY_KEY, JSON.stringify({ height: q.height, fps: q.fps, level: q.level })); } catch {}
 }
 const ID_PREFIX = 'hqstream-dk-';
 
@@ -512,9 +526,11 @@ try {
   const saved = JSON.parse(localStorage.getItem(QUALITY_KEY));
   if ([720, 1080, 1440].includes(saved?.height)) $('resSelect').value = saved.height;
   if ([30, 60, 120].includes(saved?.fps)) $('fpsSelect').value = saved.fps;
+  if (saved?.level in BITRATE_LEVELS) $('bitrateSelect').value = saved.level;
 } catch {}
 $('resSelect').onchange = updateQualityHint;
 $('fpsSelect').onchange = updateQualityHint;
+$('bitrateSelect').onchange = updateQualityHint;
 updateQualityHint();
 
 $('startBtn').onclick = startHost;
